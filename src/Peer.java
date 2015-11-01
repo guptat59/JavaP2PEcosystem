@@ -19,9 +19,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 
 public class Peer {
@@ -47,11 +45,14 @@ public class Peer {
 		static final String ServerDir = "Files/Server/";
 		static final String getTotalChunks = "getTotalChunks";
 		static final String getNextChunk = "getNextChunk";
+		static final String getChunkInfo = "getChunkInfo";
 		static final String seperator = "#";
 	}
 
 	private static int totalChunks = -1;
-	private static AtomicInteger totalChunksCtr = new AtomicInteger();
+	private static Integer totalChunksCtr = -1;
+	static Thread downloadThread = null;
+	static Thread uploadThread = null;
 
 	// main method
 	public static void main(String args[]) throws Exception {
@@ -74,16 +75,27 @@ public class Peer {
 		log.info(String.format("Input: \nServer listening port \t: %d,\nPeer listening Port\t: %d, \nNeighbour port\t\t: %d", sPort, peerPort, neighPort));
 
 		// Get few chunks from the server.
-		getChunksFromServer(2);
+		getChunksFromServer(50);
 
-		Thread u = new UploadThread(peerPort);
-		u.start();
+		uploadThread = new UploadThread(peerPort);
+		uploadThread.start();
 
-		Thread d = new DownloadThread(neighPort);
-		d.start();
+		downloadThread = new DownloadThread(neighPort);
+		downloadThread.start();
 	}
 
-	static boolean onlyOnce = true;
+	static boolean firstRun = true;
+	static ArrayList<Integer> listOfChunks = null;
+
+	synchronized static String getNextChunk() {
+		if (listOfChunks != null && listOfChunks.size() > 0) {
+			int index = ThreadLocalRandom.current().nextInt(0, listOfChunks.size());
+			int temp = listOfChunks.get(index);
+			listOfChunks.remove(index);
+			return Server.fileName + "." + temp;
+		}
+		return null;
+	}
 
 	private static void getChunksFromServer(int noOfChunks) throws Exception {
 
@@ -94,30 +106,49 @@ public class Peer {
 
 			log.info("Connected to " + serverHost + " at port " + sPort);
 
-			if (onlyOnce) {
-				onlyOnce = !onlyOnce;
+			if (firstRun) {
 				// Get how many total chunks are present on the server. We need
 				// to download these many number of chunks from server/peers.
 				out.writeObject(Constants.getTotalChunks);
 				out.flush();
 				totalChunks = Integer.parseInt(String.valueOf(in.readObject()));
-				totalChunksCtr.set(totalChunks);
+				totalChunksCtr = totalChunks;
+				log.severe("Got total chunks from server as : " + totalChunksCtr);
+				listOfChunks = new ArrayList<>();
+				for (int i = 0; i < totalChunks; i++) {
+					listOfChunks.add(i);
+				}
 			}
 			HashMap<String, Long> chunkNames = new HashMap<String, Long>();
 			// Download random chunks from the server. Pass peer id to help
 			// server differentiate.
-			while (noOfChunks > 0) {
+			while (noOfChunks > 0 && listOfChunks.size() > 0) {
 
-				// Get the list of files residing on the server.
-				out.writeObject(Constants.getNextChunk + Constants.seperator + Name);
-				out.flush();
+				if (firstRun) {
+					// Get the list of files residing on the server.
+					out.writeObject(Constants.getNextChunk + Constants.seperator + Name);
+					out.flush();
+				} else {
+					String next = getNextChunk();
+					if (next == null) {
+						mergeAndExit();
+						return;
+					}
+					out.writeObject(Constants.getChunkInfo + Constants.seperator + next);
+					out.flush();
+				}
 
 				String str = (String) in.readObject();
 				String[] info = str.split(Constants.seperator);
-				String chunkName = info[0];
-				long size = Integer.parseInt(info[1]);
+				String chunkName = info[0];				
+				long size = Server.sizeOfChunk;				
 
 				if (chunkName != null && size > 0) {
+
+					File f = new File(peerDirPrefix + chunkName);
+					if (f.exists())
+						continue;
+
 					// Request for the above received chunk.
 					log.info("Requesting chunk : " + chunkName);
 					out.writeObject(chunkName);
@@ -125,22 +156,22 @@ public class Peer {
 
 					// receive file
 					long timeStamp = System.currentTimeMillis();
-					File f = new File(peerDirPrefix + chunkName);
 					f.getParentFile().mkdirs();
 					try (OutputStream fos = new FileOutputStream(f)) {
-						byte[] bytes = new byte[Server.sizeOfChunks];
+						byte[] bytes = new byte[Server.sizeOfChunk];
 
 						int count;
 						int totalBytes = 0;
 						while ((count = in.read(bytes)) > 0) {
 							totalBytes += count;
-							log.finest("Writing " + count + " total : " + totalBytes + " size : " + Server.sizeOfChunks);
+							log.finest("Writing " + count + " total : " + totalBytes + " size : " + Server.sizeOfChunk);
 							fos.write(bytes, 0, count);
 							if (totalBytes == size)
 								break;
 						}
 						fos.flush();
 						log.info("Created chunk : " + chunkName + " in " + (System.currentTimeMillis() - timeStamp));
+						listOfChunks.remove(extractId(chunkName));
 						chunkNames.put(chunkName, size);
 					}
 				}
@@ -152,9 +183,12 @@ public class Peer {
 					String entry = chunkName + Constants.seperator + chunkNames.get(chunkName);
 					writer.write(entry);
 					writer.newLine();
-					totalChunksCtr.decrementAndGet();
+					totalChunksCtr--;
+					if (totalChunksCtr == 0)
+						mergeAndExit();
 				}
 			}
+			firstRun = false;
 		} catch (ConnectException ce) {
 			System.err.println("Connection refused. You need to initiate a server first.");
 		} catch (UnknownHostException uhe) {
@@ -162,18 +196,37 @@ public class Peer {
 		} catch (IOException ioException) {
 			ioException.printStackTrace();
 		}
+	}
 
+	static Integer extractId(String fileName) {
+		return fileName == null ? -1 : Integer.parseInt(fileName.replace(Server.fileName + ".", ""));
 	}
 
 	synchronized private static void appendToSummary(String chunkName, Long size) {
 		try (BufferedWriter writer = new BufferedWriter(new FileWriter(peerDirPrefix + summaryFile, true))) {
-			totalChunksCtr.decrementAndGet();
+			totalChunksCtr--;
 			writer.write(chunkName + Constants.seperator + size);
 			writer.newLine();
 			writer.flush();
 		} catch (IOException e) {
 			e.printStackTrace();
 		}
+	}
+
+	private static void mergeAndExit() throws Exception {
+		// System converged. Merge all the files to recreate
+		// the original file.
+		OutputStream fos = new FileOutputStream(peerDirPrefix + Server.fileName);
+		for (int i = 0; i < totalChunks; i++) {
+			String fname = peerDirPrefix + Server.fileName + "." + String.format(Server.formatSpecifier, i);
+			log.info("Looking for file " + fname);
+			File f = new File(fname);
+			Files.copy(f.toPath(), fos);
+		}
+		fos.flush();
+		log.info("Downloaded File!!");
+		fos.close();
+		downloadThread.interrupt();
 	}
 
 	private static HashMap<String, Long> summaryAsMap() {
@@ -194,6 +247,7 @@ public class Peer {
 			} catch (Exception e) {
 				e.printStackTrace();
 			}
+
 			return list;
 		}
 		return null;
@@ -237,7 +291,7 @@ public class Peer {
 				try (ObjectOutputStream out = new ObjectOutputStream(neighSocket.getOutputStream()); ObjectInputStream in = new ObjectInputStream(neighSocket.getInputStream());) {
 					while (true) {
 
-						log.info("Requesting summary of " + neighSocket.toString() + " totalChunksCtr " + totalChunksCtr.get());
+						log.info("Requesting summary of " + neighSocket.toString() + " totalChunksCtr " + totalChunksCtr);
 						out.writeObject(Constants.getSummary);
 						out.flush();
 						HashMap<String, Long> neighList = (HashMap<String, Long>) in.readObject();
@@ -266,20 +320,24 @@ public class Peer {
 							// Receive the actual file
 							long timeStamp = System.currentTimeMillis();
 							File f = new File(peerDirPrefix + chunkName);
+							if (f.exists())
+								continue;
 							f.getParentFile().mkdirs();
+
 							try (OutputStream fos = new FileOutputStream(f)) {
-								byte[] bytes = new byte[Server.sizeOfChunks];
+								byte[] bytes = new byte[Server.sizeOfChunk];
 								int count;
 								int totalBytes = 0;
 								while ((count = in.read(bytes)) > 0) {
 									totalBytes += count;
-									log.finest("Writing " + count + " total : " + totalBytes + " size : " + Server.sizeOfChunks);
+									log.finest("Writing " + count + " total : " + totalBytes + " size : " + Server.sizeOfChunk);
 									fos.write(bytes, 0, count);
 									if (totalBytes == diffList.get(chunkName))
 										break;
 								}
 								fos.flush();
 								log.info("Created chunk : " + chunkName + " in " + (System.currentTimeMillis() - timeStamp));
+								listOfChunks.remove(extractId(chunkName));
 								appendToSummary(chunkName, diffList.get(chunkName));
 							}
 						}
@@ -288,19 +346,8 @@ public class Peer {
 						// yes, merge the files and stop download thread. Else,
 						// sleep for 1 second and start downloading again.
 
-						if (totalChunksCtr.get() == 0) {
-							// System converged. Merge all the files to recreate
-							// the original file.
-							OutputStream fos = new FileOutputStream(peerDirPrefix + Server.fileName);
-							for (int i = 0; i < totalChunks; i++) {
-								String fname = peerDirPrefix + Server.fileName + "." + String.format(Server.formatSpecifier, i);
-								log.info("Looking for file " + fname);
-								File f = new File(fname);
-								Files.copy(f.toPath(), fos);
-							}
-							fos.flush();
-							log.info("Downloaded File!!");
-							fos.close();
+						if (totalChunksCtr == 0) {
+							mergeAndExit();
 							break;
 						} else {
 							Thread.sleep(100);

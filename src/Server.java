@@ -14,7 +14,8 @@ import java.net.BindException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.file.Files;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.HashMap;
+import java.util.Hashtable;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -32,12 +33,12 @@ public class Server {
 	public static String formatSpecifier = "%05d";
 	static final Logger log = Logger.getLogger(Server.class.getSimpleName());
 	private static int noOfChunks = 10;
-	public static final int sizeOfChunks = 100 * 1024;// 100KB chunks.
+	public static final int sizeOfChunk = 100 * 1024;// 100KB chunks.
 	public static final String fileName = "43394921.txt";
-	private static final String fileContent = "\nThis content is just a repetitive boring one line that has been written to make this line look longer and the file size to grow really faster. If you are still reading this, Just stop.\nLine:";
-	private static ConcurrentHashMap<String, Long> listOfChunks = null;
+	private static final String fileContent = "\nOne of the great tragedies of our time is that in our desperate incapacity to cope with the complexities of our world, we oversimplify every issue and reduce it to a neat ideological formula. Doubtless we have to do something in order to grasp things quickly and effectively. But unfortunately this quick and effective grasp too often turns out to be no grasp at all, or only a grasp on a shadow. The ideological formulas for which we are willing to tolerate and even provoke the destruction of entire nations may one day reveal themselves to have been the most complete deceptions….The American conscience is troubled by a sense of tragic ambiguity in our professed motives for massive intervention. Yet in the name of such tenuous and questionable motives we continue to bomb, to burn, and to kill because we think we have no alternative, and because we are reduced to a despairing trust in the assurance of experts in whom we have no real confidence. -- Thomas Merton was an American Catholic writer:";
+	private static Hashtable<String, Long> listOfChunks = null;
 
-	private static ConcurrentHashMap<String, Long> pendingListOfFiles = null;
+	// private static ConcurrentHashMap<String, Long> pendingListOfFiles = null;
 
 	public static void main(String[] args) throws Exception {
 
@@ -55,8 +56,6 @@ public class Server {
 		log.info(String.format("Input: \nServer port \t: %d,\nnoOfChunks \t: %d", sPort, noOfChunks));
 
 		initFile(noOfChunks);
-
-		pendingListOfFiles = listOfChunks;
 
 		try {
 
@@ -106,19 +105,28 @@ public class Server {
 						request = ((String) in.readObject()).trim();
 
 						if (request.startsWith(Peer.Constants.getNextChunk)) {
-							int size = pendingListOfFiles.keySet().size();
+							int size = listOfChunks.keySet().size();
 							int temp = sharedVariable.incrementAndGet();
 							int next = temp % size;
 							String resourceName = fileName + "." + String.format(formatSpecifier, next);
-							String response = resourceName + Peer.Constants.seperator + pendingListOfFiles.get(resourceName);
-							log.info("Sending getNextChunk : " + response + " next : " + next + " size : " + size);
+							String response = resourceName + Peer.Constants.seperator + listOfChunks.get(resourceName.trim());
+							log.info("Sending getNextChunk : " + response + " next : " + next + " size : " + listOfChunks.get(resourceName.trim()) + " has : "
+									+ listOfChunks.containsKey(resourceName.trim()));
+							out.writeObject(response);
+							out.flush();
+						} else if (request.startsWith(Peer.Constants.getChunkInfo)) {
+							String resourceName = request.split(Peer.Constants.seperator)[1].trim();
+							String response = resourceName + Peer.Constants.seperator + listOfChunks.get(resourceName.trim());
+							log.info("Sending getChunkInfo : " + response + " size " + listOfChunks.get(resourceName.trim()) + " has : "
+									+ listOfChunks.containsKey(resourceName.trim()));
 							out.writeObject(response);
 							out.flush();
 						} else if (request.startsWith(Peer.Constants.getTotalChunks)) {
-							out.writeObject(listOfChunks.size());
+							out.writeObject(new Integer(listOfChunks.size()));
 							out.flush();
 						} else if (request.startsWith(fileName)) {
 							String fileName = request;
+							log.info("Sending " + fileName + " from server to peer " + peerId);
 							File f = new File(Peer.Constants.ServerDir + fileName);
 							Files.copy(f.toPath(), d);
 							d.flush();
@@ -147,7 +155,7 @@ public class Server {
 		// Initialization code to read the files.
 		try {
 			File f = createFile(noOfChunks);
-			listOfChunks = new ConcurrentHashMap<String, Long>();
+			listOfChunks = new Hashtable<String, Long>();
 			splitFile(f, noOfChunks);
 		} catch (SecurityException | IOException e) {
 			log.log(Level.SEVERE, e.getMessage());
@@ -160,21 +168,19 @@ public class Server {
 		if (!f.exists() || f.length() == 0L) {
 			f.getParentFile().mkdirs();
 			f.createNewFile();
-			FileWriter fileWritter = new FileWriter(f, true);
-			BufferedWriter bufferWritter = new BufferedWriter(fileWritter);
-			long timestamp = System.currentTimeMillis();
-			long localVar = 0L;
-			StringBuffer sb;
-			while (f.length() < noOfChunks * 100 * 1024) {
-				sb = new StringBuffer();
-				for (int i = 0; i < 1000; i++) {
-					sb.append(fileContent + localVar++ + "\n");
+			try (FileOutputStream fos = new FileOutputStream(f)) {
+				long timestamp = System.currentTimeMillis();
+				byte[] content = (fileContent + String.format("%08d", 0)).getBytes();
+				long m = (noOfChunks * sizeOfChunk) / content.length;
+				for (long i = 1; i <= m; i++) {					
+					String ctr = String.format("%08d", i);
+					content = (fileContent + ctr).getBytes();
+					fos.write(content, 0, content.length);
 				}
-				fileWritter.append(sb);
-				bufferWritter.flush();
+				fos.write(content, 0, (int) ((noOfChunks * sizeOfChunk) % content.length));
+				fos.flush();
+				log.info("Created File of size : " + f.length() + " bytes in " + (System.currentTimeMillis() - timestamp) + " milliseconds");
 			}
-			bufferWritter.close();
-			log.info("Created File of size : " + f.length() + "bytes in " + (System.currentTimeMillis() - timestamp) + " milliseconds");
 		}
 		return f;
 	}
@@ -187,15 +193,17 @@ public class Server {
 		if (f.length() > 0L) {
 
 			int partCtr = 0;
-			byte[] buffer = new byte[sizeOfChunks];
+			byte[] buffer = new byte[sizeOfChunk];
 			try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(f))) {
 				int tmp = 0;
 				while ((tmp = bis.read(buffer)) > 0) {
-					File newFile = new File(f.getParent(), f.getName() + "." + String.format(formatSpecifier, partCtr++));
-					try (FileOutputStream out = new FileOutputStream(newFile)) {
-						out.write(buffer, 0, tmp);
-						listOfChunks.put(newFile.getName(), newFile.length());
-						log.info("Created File : " + newFile.getName() + " size : " + newFile.length() + "bytes");
+					if (tmp == sizeOfChunk) {
+						File newFile = new File(f.getParent(), f.getName() + "." + String.format(formatSpecifier, partCtr++));
+						try (FileOutputStream out = new FileOutputStream(newFile)) {
+							out.write(buffer, 0, tmp);
+							listOfChunks.put(newFile.getName(), newFile.length());
+							log.info("Created File : " + newFile.getName() + " size : " + newFile.length() + "bytes");
+						}
 					}
 				}
 			}
