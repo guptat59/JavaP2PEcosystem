@@ -12,7 +12,7 @@
 * Server.bat and Peer.bat have the required configuration to change the parameters.
 
 ## Owner ##
-* [Tarun Gupta Akirala](https://github.com/guptat59/) 
+* [Tarun Gupta Akirala](https://github.com/takirala/) 
 
 ## How does this work? ##
 
